@@ -23,6 +23,7 @@ Usage:
  In Colab/notebook:
    cf, hybrid, train_df = main(train_path, test_path)
 """
+import math
 import pandas as pd
 import numpy as np
 import os, sys
@@ -85,41 +86,360 @@ class AprioriMiner:
             else:
                 break
         return self.frequent_itemsets
+class PatternScorer:
+    def __init__(self, transactions, frequent_itemsets, item_support):
+        self.transactions = transactions
+        self.frequent_itemsets = frequent_itemsets
+        self.item_support = item_support
+        self.user_data = None
+    
+    def add_user_data(self, data):
+        """Add user-specific data for personalized scoring"""
+        self.user_data = data
+        
+        # Prepare user profiles
+        self.user_item_frequencies = defaultdict(lambda: defaultdict(int)) 
+        #This dictionary stores user's latest date making purchase on each item
+        self.user_last_purchase = defaultdict(lambda: defaultdict(str))
+        
+        # Group data by user
+        for _, row in data.iterrows():
+            user = row['user_id']
+            item = row['itemDescription']
+            date = row['Date']
+            
+            # Update frequency
+            self.user_item_frequencies[user][item] += 1
+            
+            # Update last purchase date if needed (if we found a new record of current user purchasing same item but more recent) 
+            if item not in self.user_last_purchase[user] or date > self.user_last_purchase[user][item]:
+                self.user_last_purchase[user][item] = date
+    
+    def score_patterns(self, method='combined', user_id=None, top_n=None):
+        """
+        Score patterns using various metrics.
+        
+        Parameters:
+        -----------
+        method : str, default='combined'
+            Scoring method: 'support', 'lift', 'recency', or 'combined'
+        user_id : int, optional
+            If provided, personalize scores for this user
+        top_n : int, optional
+            If provided, return only top N patterns
+        
+        Returns:
+        --------
+        list
+            Scored patterns as (itemset, score) tuples
+        """
+        # Create a flat list of all itemsets with their supports
+        all_itemsets = []
+        for k in self.frequent_itemsets:
+            all_itemsets.extend([(frozenset(itemset), support) 
+                                for itemset, support in self.frequent_itemsets[k]])
+        
+        # Apply scoring method
+        if method == 'support':
+            scored_patterns = [(list(itemset), support) for itemset, support in all_itemsets]
+        
+        elif method == 'lift':
+            scored_patterns = []
+            for itemset, support in all_itemsets:
+                if len(itemset) <= 1:
+                    # For single items, just use support
+                    scored_patterns.append((list(itemset), support))
+                else:
+                    # Calculate average lift for this pattern
+                    avg_lift = self._calculate_pattern_lift(itemset, support)
+                    # WEIGHT BY SUPPORT==============
+                    # score = avg_lift * support
+                    score = avg_lift
+                    scored_patterns.append((list(itemset), score))
+        
+        elif method == 'recency':
+            if user_id is None or self.user_data is None:
+                raise ValueError("User ID and user data required for recency scoring")
+            
+            scored_patterns = []
+            for itemset, support in all_itemsets:
+                # Calculate recency score
+                recency_score = self._calculate_recency_score(itemset, user_id)
+                # Combine with support
+                # score = recency_score * support
+                score = recency_score
+                scored_patterns.append((list(itemset), score))
+        
+        elif method == 'combined':
+            # Define weights for different factors
+            w_support = 0.4
+            w_lift = 0.3
+            w_recency = 0.2
+            w_frequency = 0.1
+            
+            scored_patterns = []
+            for itemset, support in all_itemsets:
+                # Start with support component
+                score_components = [support * w_support]
+                
+                # Add lift component for multi-item patterns
+                if len(itemset) > 1:
+                    lift = self._calculate_pattern_lift(itemset, support)
+                    score_components.append(lift * w_lift)
+                else:
+                    # For 1-itemsets, still add the weight
+                    score_components.append(w_lift)
+                
+                # Add user-specific components if available
+                if user_id is not None and self.user_data is not None:
+                    # Recency component
+                    recency = self._calculate_recency_score(itemset, user_id)
+                    score_components.append(recency * w_recency)
+                    
+                    # Frequency component
+                    frequency = self._calculate_frequency_score(itemset, user_id)
+                    score_components.append(frequency * w_frequency)
+                else:
+                    # Without user data, add the weights
+                    score_components.extend([w_recency, w_frequency])
+                
+                # Calculate final score
+                final_score = sum(score_components)
+                scored_patterns.append((list(itemset), final_score))
+        
+        else:
+            raise ValueError(f"Unknown scoring method: {method}")
+        
+        # Sort by score (descending)
+        scored_patterns.sort(key=lambda x: x[1], reverse=True)
+        
+        # Return top N if specified
+        if top_n is not None:
+            return scored_patterns[:top_n]
+        return scored_patterns
+    
+    def _calculate_pattern_lift(self, pattern, pattern_support):
+        """Calculate average lift across all possible rules from this pattern"""
+        if len(pattern) <= 1:
+            return 1.0  # No meaningful lift for singleton sets
+        
+        lifts = []
+        
+        # For each possible rule A -> B from this pattern
+        for i in range(1, len(pattern)): #len(antecedent) from 1 to len(pattern) - 1, antecedent cannot be empty 
+            for antecedent_items in combinations(pattern, i):
+                antecedent = frozenset(antecedent_items)
+                consequent = pattern - antecedent
+                
+                # Find supports
+                antecedent_support = self._get_itemset_support(antecedent)
+                consequent_support = self._get_itemset_support(consequent)
+                
+                if antecedent_support > 0 and consequent_support > 0:
+                    # A => B, lift = Supp(A,B)/ (Supp(A) * Supp(B)) = Conf(A,B) / Supp(B)
+                    confidence = pattern_support / antecedent_support
+                    lift = confidence / consequent_support
+                    lifts.append(lift)
+        
+        # Return average lift
+        return sum(lifts) / len(lifts) if lifts else 1.0
+    
+    def _get_itemset_support(self, itemset):
+        """Get support for an itemset"""
+        if len(itemset) == 1:
+            item = list(itemset)[0]
+            return self.item_support.get(item, 0)
+        
+        # Search in frequent itemsets
+        for k in self.frequent_itemsets:
+            if k == len(itemset):
+                for candidate, support in self.frequent_itemsets[k]:
+                    if frozenset(candidate) == itemset:
+                        return support
+        
+        return 0  # Not found (not frequent)
+    
+    def _calculate_recency_score(self, pattern, user_id):
+        """Calculate recency score based on how recently user purchased items"""
+        if user_id not in self.user_last_purchase:
+            return 0.5  # Default for users with no history
+        
+        # Get the latest date a purchase was made
+        latest_date = max(date for user_dates in self.user_last_purchase.values() 
+                         for date in user_dates.values())
+        
+        # Calculate recency for each item in pattern
+        recency_scores = []
+        for item in pattern:
+            if item in self.user_last_purchase[user_id]:
+                last_purchase = self.user_last_purchase[user_id][item]
+                days_since = (latest_date - last_purchase).days
+                
+                # Convert to a normalized score (higher is more recent)
+                # Using exponential decay: e^(-days/30)
+                recency = math.exp(-days_since / 30)
+                recency_scores.append(recency)
+        
+        # Return average recency
+        return sum(recency_scores) / len(recency_scores) if recency_scores else 0.5
+    
+    def _calculate_frequency_score(self, pattern, user_id):
+        """Calculate frequency score based on how often user buys these items"""
+        if user_id not in self.user_item_frequencies:
+            return 0.5  # Default for users with no history
+        
+        # Find the maximum frequency across all users and items
+        max_freq = max(freq for user_freq in self.user_item_frequencies.values() 
+                      for freq in user_freq.values())
+        
+        # Calculate normalized frequency for each item in pattern
+        freq_scores = []
+        for item in pattern:
+            if item in self.user_item_frequencies[user_id]:
+                # Normalize by max frequency
+                norm_freq = self.user_item_frequencies[user_id][item] / max_freq
+                freq_scores.append(norm_freq)
+        
+        # Return average frequency
+        return sum(freq_scores) / len(freq_scores) if freq_scores else 0.5
 
 class FrequentPatternMiner:
-    """Wraps AprioriMiner to provide a simple get_patterns() API."""
-    def __init__(self, min_support=0.005):
-        self.miner = AprioriMiner(min_support=min_support)
+    """
+    A class for mining and scoring frequent patterns from grocery transaction data.
+    """
+    
+    def __init__(self, min_support=0.005, min_confidence=0.3):
+        """
+        Initialize the pattern miner.
+        
+        Parameters:
+        -----------
+        min_support : float, default=0.005
+            Minimum support threshold (between 0 and 1)
+        min_confidence : float, default=0.3
+            Minimum confidence threshold for association rules
+        """
+        self.min_support = min_support
+        self.min_confidence = min_confidence
+        self.apriori_miner = None
+        self.pattern_scorer = None
         self.transactions = None
-
-    def fit(self, df, user_id=None):
-        # prepare transactions by user (or full)
-        if user_id:
-            df_u = df[df['User_id']==user_id]
+    def prepare_transactions(self, data):
+        """
+        Convert raw data to transaction format.
+        
+        Parameters:
+        -----------
+        data : pandas.DataFrame
+            Raw input data
+        
+        Returns:
+        --------
+        list of lists
+            Transactions in the right format for pattern mining
+        """
+        # Group by user and date
+        transactions = defaultdict(list)
+        for _, row in data.iterrows():
+            key = (row['user_id'], row['Date'])
+            if pd.notna(row['itemDescription']):  # Skip null items
+                transactions[key].append(row['itemDescription'])
+        
+        # Convert to list of lists
+        transaction_list = list(transactions.values())
+        return transaction_list
+    
+    def fit(self, data, user_id=None):
+        """
+        Mine frequent patterns from the data.
+        
+        Parameters:
+        -----------
+        data : pandas.DataFrame
+            Raw input data
+        user_id : int, optional
+            If provided, focus on this user's data
+        
+        Returns:
+        --------
+        self
+        """
+        # Prepare transactions
+        if user_id is not None:
+            # Filter data for specific user
+            user_data = data[data['user_id'] == user_id]
+            if len(user_data) > 0:
+                self.transactions = self.prepare_transactions(user_data)
+            else:
+                # User has no data, use all data
+                self.transactions = self.prepare_transactions(data)
         else:
-            df_u = df
-        df_u = df_u.copy()
-        df_u['Date'] = pd.to_datetime(df_u['Date'], dayfirst=True, errors='coerce')
-        df_u = df_u.dropna(subset=['Date'])
-        # group by (user, date) pairs or by date alone
-        txns = df_u.groupby(['User_id','Date'])['itemDescription'].apply(list).tolist()
-        if not txns:
-            # fallback to full dataset
-            txns = df.groupby(['User_id','Date'])['itemDescription'].apply(list).tolist()
-        self.transactions = txns
-        self.miner.fit(txns)
+            self.transactions = self.prepare_transactions(data)
+        
+        # Run Apriori
+        self.apriori_miner = AprioriMiner(min_support=self.min_support)
+        frequent_itemsets = self.apriori_miner.fit(self.transactions)
+        
+        # Create pattern scorer
+        self.pattern_scorer = PatternScorer(
+            self.transactions, 
+            frequent_itemsets, 
+            self.apriori_miner.item_support
+        )
+        self.pattern_scorer.add_user_data(data)
+        
         return self
-
-    def get_patterns(self, top_n=10):
-        # flatten all frequent itemsets
-        flat = []
-        for k, lst in self.miner.frequent_itemsets.items():
-            for (iset, sup) in lst:
-                flat.append((tuple(iset), sup))
-        # sort by support descending
-        flat.sort(key=lambda x: x[1], reverse=True)
-        return flat[:top_n]
-
+    
+    def get_patterns(self, method='combined', user_id=None, top_n=10):
+        """
+        Get scored patterns.
+        
+        Parameters:
+        -----------
+        method : str, default='combined'
+            Scoring method: 'support', 'lift', 'recency', or 'combined'
+        user_id : int, optional
+            If provided, personalize scores for this user
+        top_n : int, default=10
+            Number of patterns to return
+        
+        Returns:
+        --------
+        list
+            List of (pattern, score) tuples
+        """
+        if self.pattern_scorer is None:
+            raise ValueError("You must call fit() before get_patterns()")
+        
+        return self.pattern_scorer.score_patterns(
+            method=method, 
+            user_id=user_id, 
+            top_n=top_n
+        )
+    
+    def get_rules(self, top_n=20):
+        """
+        Get association rules.
+        
+        Parameters:
+        -----------
+        top_n : int, default=20
+            Number of rules to return
+            
+        Returns:
+        --------
+        list
+            List of association rules
+        """
+        if self.apriori_miner is None:
+            raise ValueError("You must call fit() before get_rules()")
+        
+        rules = self.apriori_miner.generate_rules(min_confidence=self.min_confidence)
+        
+        # Sort by lift
+        sorted_rules = sorted(rules, key=lambda x: x['lift'], reverse=True)
+        
+        return sorted_rules[:top_n]
 # --- Task 2: Collaborative Filtering -------------------------------------
 class CollaborativeFilteringRecommender:
     """User-based CF with optional recency weighting."""
@@ -140,7 +460,7 @@ class CollaborativeFilteringRecommender:
         # build weights
         user_items = defaultdict(lambda: defaultdict(float))
         for _,r in df2.iterrows():
-            u,i,d = r['User_id'], r['itemDescription'], r['Date']
+            u,i,d = r['user_id'], r['itemDescription'], r['Date']
             w = self.decay**((latest-d).days) if self.recency else 1.0
             user_items[u][i]+=w
         # maps
@@ -203,12 +523,12 @@ def precision_at_k(recs, actuals, k=5):
 
 
 def evaluate_models(cf, hybrid, train_df, test_df, top_n=5):
-    users=test_df['User_id'].unique()
+    users=test_df['user_id'].unique()
     pc,ph=[],[]
     miner=FrequentPatternMiner()
     for u in users:
-        actual=test_df[test_df['User_id']==u]['itemDescription'].tolist()
-        hist=train_df[train_df['User_id']==u]['itemDescription'].tolist()
+        actual=test_df[test_df['user_id']==u]['itemDescription'].tolist()
+        hist=train_df[train_df['user_id']==u]['itemDescription'].tolist()
         rec_cf=cf.recommend(u,exclude_items=hist)
         miner.fit(train_df,user_id=u)
         pats=miner.get_patterns(top_n)
@@ -228,7 +548,7 @@ def main(train_path,test_path=None):
         uid=input("user_id (or exit):").strip()
         if uid=='exit': break
         opt=input("with/without patterns:").strip()
-        hist=df[df['User_id']==uid]['itemDescription'].tolist()
+        hist=df[df['user_id']==uid]['itemDescription'].tolist()
         if opt=='without': recs=cf.recommend(uid,exclude_items=hist)
         else:
             miner=FrequentPatternMiner().fit(df,user_id=uid)
