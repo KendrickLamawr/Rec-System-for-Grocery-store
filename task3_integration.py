@@ -35,11 +35,11 @@ except ImportError:
 from mlxtend.preprocessing import TransactionEncoder
 from mlxtend.frequent_patterns import fpgrowth
 
-def get_frequent_patterns(df, min_support=0.02, recency_weight=False, decay_factor=0.9, user_id = None): #user_id
+def get_frequent_patterns(user_id, df, min_support=0.02, recency_weight=False, decay_factor=0.9):
     """
     FP-Growth per user: drops missing dates to avoid NaT errors.
     """
-    user_df = df# df[df['User_id'] == user_id].copy()
+    user_df = df[df['User_id'] == user_id].copy()
     # parse dates, drop rows where parsing fails
     user_df['Date'] = pd.to_datetime(user_df['Date'], dayfirst=True, errors='coerce')
     user_df = user_df.dropna(subset=['Date'])
